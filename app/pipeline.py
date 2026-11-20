@@ -19,13 +19,20 @@ from __future__ import annotations
 
 import math
 import os
-import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 from astropy.io import fits
+
+from .detector import (
+    DetectorSection,
+    binning_from_span,
+    check_binning_header,
+    detsec_from_header,
+)
+from .errors import PreparationError, sanitize_ascii
 
 MIN_FRAMES = 3
 MAX_FRAMES = 12
@@ -41,15 +48,6 @@ RAW_OFFSET = 32768
 FITS_BLOCK = 2880  # FITS 头部与数据块的最小对齐单位
 
 
-class PreparationError(Exception):
-    """整批制备失败；status_code 决定 HTTP 响应码。"""
-
-    def __init__(self, message: str, status_code: int = 422) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.message = message
-
-
 @dataclass(frozen=True)
 class FrameInfo:
     """单帧的元数据与第一趟统计结果。"""
@@ -62,6 +60,7 @@ class FrameInfo:
     bzero: float
     blank: int | None
     median: float
+    detsec: DetectorSection | None = None
 
 
 def _open_raw(path: Path) -> fits.HDUList:
@@ -121,6 +120,24 @@ def _validate_hdus(hdul: fits.HDUList, name: str) -> tuple[int, fits.ImageHDU]:
             f"帧 {name} 尺寸 {width}x{height} 非法，宽高均须在 1~{MAX_DIM} 之间"
         )
     return index, hdu
+
+
+def _detsec_signature(
+    header: fits.Header, shape: tuple[int, int], name: str
+) -> DetectorSection | None:
+    """读取可选 DETSEC，并校验分箱与头部声明一致。
+
+    DETSEC 缺失时不做任何几何假设，只是不参与同批一致性比对。
+    """
+    section = detsec_from_header(header, name)
+    if section is None:
+        return None
+
+    x_bin = binning_from_span(section.x_span, shape[1], "x", name, section)
+    y_bin = binning_from_span(section.y_span, shape[0], "y", name, section)
+    check_binning_header(header, name, ("BINX", "XBINNING"), x_bin, "x")
+    check_binning_header(header, name, ("BINY", "YBINNING"), y_bin, "y")
+    return section
 
 
 def _camera_filter_keys(header: fits.Header) -> dict[str, str]:
@@ -265,11 +282,6 @@ def _fill_strip(
     return _aggregate_buffer(buffer)
 
 
-def _sanitize_ascii(text: str, limit: int = 60) -> str:
-    cleaned = "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in text).strip()
-    return cleaned[:limit] or "unknown"
-
-
 def build_master_flat(
     frame_paths: list[Path],
     source_names: list[str],
@@ -298,6 +310,8 @@ def build_master_flat(
     frames: list[FrameInfo] = []
     common_shape: tuple[int, int] | None = None
     common_camera_filter: dict[str, str] | None = None
+    common_detsec: DetectorSection | None = None
+    product_header: dict[str, str] = {}
 
     # 第一趟：结构校验 + 每帧有效值直方图与中位数。
     for path, source_name in zip(frame_paths, source_names):
@@ -306,6 +320,7 @@ def build_master_flat(
             shape = (int(hdu.data.shape[0]), int(hdu.data.shape[1]))
             bscale, bzero, blank = _read_scaling(hdu.header, path.name)
             camera_filter = _camera_filter_keys(hdu.header)
+            detsec = _detsec_signature(hdu.header, shape, path.name)
 
         if common_shape is None:
             common_shape = shape
@@ -323,6 +338,16 @@ def build_master_flat(
                 f"{common_camera_filter} 不一致，同批相机与滤镜须一致"
             )
 
+        # 同批 DETSEC 要么全缺、要么全有且完全相同：同一未分箱范围与轴向。
+        if not frames:
+            common_detsec = detsec
+        elif detsec != common_detsec:
+            raise PreparationError(
+                f"帧 {path.name} 的 DETSEC {detsec.text() if detsec else '缺失'} "
+                f"与首帧 {common_detsec.text() if common_detsec else '缺失'} 不一致，"
+                "同批须为同一未分箱范围与轴向"
+            )
+
         total, hist = _frame_median(
             path, image_index, bscale, bzero, blank, saturation
         )
@@ -330,8 +355,14 @@ def build_master_flat(
         if not math.isfinite(median) or median <= 0.0:
             raise PreparationError(f"帧 {path.name} 的有效中位数非法（{median}）")
         frames.append(
-            FrameInfo(path, source_name, shape, image_index, bscale, bzero, blank, median)
+            FrameInfo(
+                path, source_name, shape, image_index, bscale, bzero, blank,
+                median, detsec,
+            )
         )
+        for key, value in (("INSTRUME", "INSTRUME"), ("FILTER", "FILTER")):
+            if key in camera_filter:
+                product_header[value] = camera_filter[key]
 
     assert common_shape is not None
     height, width = common_shape
@@ -350,7 +381,9 @@ def build_master_flat(
         master[:, col0:col1] = median_strip
         counts[:, col0:col1] = count_strip
 
-    return _write_output(frames, saturation, master, counts, output_dir, work_dir)
+    return _write_output(
+        frames, saturation, master, counts, output_dir, work_dir, product_header
+    )
 
 
 def _write_fits_low_memory(
@@ -397,6 +430,7 @@ def _write_output(
     counts: np.ndarray,
     output_dir: Path,
     work_dir: Path,
+    product_header: dict[str, str],
 ) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     token = os.urandom(3).hex()
@@ -410,6 +444,13 @@ def _write_output(
     header["NFRAMES"] = (len(frames), "Number of input flat frames")
     header["SATURATE"] = (saturation, "Saturation threshold in data units")
     header["MINCNT"] = (MIN_FRAMES_PER_PIXEL, "Minimum frames for a valid pixel")
+    # 相机/滤镜标识随成品保留，供 /calibrate 匹配科学帧。
+    for key in ("INSTRUME", "FILTER"):
+        if key in product_header:
+            header[key] = product_header[key]
+    # DETSEC 原样保留（同一未分箱范围与轴向），成品像素按该范围排列。
+    if frames[0].detsec is not None:
+        header["DETSEC"] = (frames[0].detsec.text(), "Detector section (unbinned)")
     header["CREATED"] = (
         datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "Creation time (UTC)",
@@ -425,7 +466,7 @@ def _write_output(
         "median; pixels seen by fewer than 3 frames are NaN."
     )
     for idx, frame in enumerate(frames):
-        header.add_history(f"Input {idx + 1:02d}: {_sanitize_ascii(frame.source_name)}")
+        header.add_history(f"Input {idx + 1:02d}: {sanitize_ascii(frame.source_name)}")
 
     counts_hdu = fits.ImageHDU(data=counts, name="COUNTS")
     # 取头部副本后立即释放 HDU，避免 HDU 额外持有数据引用。
